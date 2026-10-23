@@ -58,6 +58,7 @@ class HudElements{
         uint32_t vendorID;
         int hdr_status = 0;
         int refresh = 0;
+        float scanout_refresh = 0.f;
         unsigned int vsync = 10;
 
         enum display_servers {
@@ -87,6 +88,7 @@ class HudElements{
         static void proc_vram();
         static void ram();
         static void procmem();
+        static void cgroup_mem();
         static void fps();
         static void engine_version();
         static void gpu_name();

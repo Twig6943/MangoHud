@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <deque>
 #include "imgui.h"
 #include <atomic>
@@ -8,6 +9,7 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <future>
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/base_sink.h>
@@ -43,12 +45,13 @@ public:
     std::atomic<bool> connected{false};
     std::mutex m;
     Fdinfo fdinfo;
-    float fps_limit = 0;
+    std::atomic<float> fps_limit{0};
     int64_t renderMinor = -1;
     std::string pEngineName;
     std::string vulkanDriver;
     std::string gpuName;
     std::string waylandDisplay;
+    bool layer_output() const { return layer_output_.load(std::memory_order_acquire); }
     bool gamescopeSession = false;
     bool waylandSurface = false;
     int buffer_size = 0;
@@ -61,18 +64,22 @@ public:
     void stop();
 
     void add_to_queue(uint64_t now) {
-        {
-            static uint64_t frame_seq = 0;
-            std::unique_lock lock(samples_mtx);
-            samples.push_back({SampleType::Frame, frame_seq, now});
-            frame_seq++;
-        }
+        static std::atomic<uint64_t> seq{0};
+        add_to_queue(SampleType::Frame, seq.fetch_add(1, std::memory_order_relaxed), now);
     }
 
     void add_to_queue(SampleType type, uint64_t seq, uint64_t now) {
+        if (is_incompatible())
+            return;
         {
-            std::unique_lock lock(samples_mtx);
-            samples.push_back({type, seq, now});
+            std::shared_lock lock(samples_mtx);
+            auto idx = samples_count.fetch_add(1, std::memory_order_relaxed);
+            if (idx >= static_cast<int>(samples_active->size())) {
+                samples_count.fetch_sub(1, std::memory_order_relaxed);
+                samples_dropped.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            samples_active->at(idx) = {type, seq, now};
         }
     }
 
@@ -87,8 +94,8 @@ public:
         return true;
     }
 
-    int push_queue();
-    static bool is_blacklisted();
+    static bool should_disable();
+    static bool is_incompatible() { return incompatible.load(); }
     bool on_connect();
     void send_resolution(uint32_t width, uint32_t height);
     void send_spdlog(const int level, const char* file, const int line, const std::string& text);
@@ -120,13 +127,20 @@ public:
     }
 
 private:
+    std::atomic<bool> layer_output_{true};
     Layer* layer;
     Backend api = Backend::NONE;
 
+    inline static std::atomic<bool> incompatible{false};
     std::atomic<bool> quit{false};
     std::thread thread;
-    std::deque<Sample> samples;
-    std::mutex samples_mtx;
+    using SampleBuffer = std::array<Sample, 10'000>;
+    SampleBuffer samples[2];
+    SampleBuffer* samples_active = &samples[0];
+    SampleBuffer* samples_pending = &samples[1];
+    std::atomic<int> samples_count{0};
+    std::atomic<uint64_t> samples_dropped{0};
+    std::shared_mutex samples_mtx;
     std::atomic<std::shared_ptr<const std::vector<std::string>>> focused_seats{
         std::make_shared<const std::vector<std::string>>()};
     std::mutex sync_mtx;
@@ -165,6 +179,8 @@ private:
     bool connect_bus();
     void disconnect_bus();
     void run_bus();
+    // Posted IPC work drains one buffer while producers fill the other.
+    int push_queue();
     bool send_resolution_signal(uint32_t width, uint32_t height);
     int request_fd_from_server();
     static int on_work_event(sd_event_source *s, int fd, uint32_t revents, void *userdata);

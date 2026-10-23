@@ -1,10 +1,12 @@
 #include "wayland.h"
 
-#include <algorithm>
 #include <chrono>
+#include <cerrno>
 #include <cstring>
+#include <algorithm>
 #include <spdlog/spdlog.h>
 #include <unistd.h>
+#include "mesa/os_time.h"
 #include "string_utils.h"
 
 Wayland::~Wayland()
@@ -31,9 +33,13 @@ bool Wayland::request_app_presentation_feedback(const std::shared_ptr<surface_da
     if (!surf_data || !surface || !globals.presentation)
         return false;
 
-    auto pending = app_feedback_pending.fetch_add(1, std::memory_order_acq_rel);
+    auto pending = app_feedback_pending.load(std::memory_order_relaxed);
+    while (pending < max_pending &&
+           !app_feedback_pending.compare_exchange_weak(pending, pending + 1,
+                                                       std::memory_order_acq_rel,
+                                                       std::memory_order_relaxed)) {
+    }
     if (pending >= max_pending) {
-        release_app_feedback_request();
         auto now = os_time_get_nano();
         auto last_log = last_app_feedback_block_log_ns.load(std::memory_order_acquire);
         if (now - last_log > 1000000000ULL &&
@@ -51,6 +57,7 @@ bool Wayland::request_app_presentation_feedback(const std::shared_ptr<surface_da
         return false;
     }
 
+    surf_data->flush_pending(true);
     wl_proxy_set_queue(reinterpret_cast<wl_proxy*>(feedback), globals.queue);
     auto* feedback_data = new presentation_feedback_data{ipc, this};
     if (wp_presentation_feedback_add_listener(feedback, &presentation_feedback_listener, feedback_data) != 0) {
@@ -69,9 +76,15 @@ std::shared_ptr<surface_data> Wayland::get_surface(wl_proxy* proxy)
     if (!proxy)
         return nullptr;
 
-    uint32_t id = wl_proxy_get_id(proxy);
     auto* surface = reinterpret_cast<wl_surface*>(proxy);
-    std::lock_guard lock(surf_m);
+    std::shared_lock lock(surf_m);
+    if (cached_surface && cached_surface->surface == surface)
+        return cached_surface;
+
+    uint32_t id = wl_proxy_get_id(proxy);
+    if (cached_surface && cached_surface->surface &&
+        wl_proxy_get_id(reinterpret_cast<wl_proxy*>(cached_surface->surface)) == id)
+        return cached_surface;
 
     auto matches = [surface, id](const std::shared_ptr<surface_data>& surf_data) {
         if (!surf_data || !surf_data->surface)
@@ -94,6 +107,9 @@ std::shared_ptr<surface_data> Wayland::get_surface(wl_proxy* proxy)
 
 bool Wayland::request_commit_presentation_feedback(wl_proxy* surface_proxy)
 {
+    if (app_feedback_pending.load(std::memory_order_relaxed) >= max_commit_app_feedback_pending)
+        return false;
+
     auto surf_data = get_surface(surface_proxy);
     if (!surf_data || !surf_data->app_feedback_via_commit)
         return false;
@@ -117,14 +133,23 @@ bool Wayland::ensure_overlay_data(const std::shared_ptr<surface_data>& surf_data
     if (!surf_data || !surf_data->display || !surf_data->surface)
         return false;
 
-    std::lock_guard lock(surf_data->m);
-
     auto* globals = ctx.get_global(surf_data->display);
     if (!globals)
         return false;
 
     if (!globals->compositor || !globals->subcompositor || !globals->dmabuf)
         return false;
+
+    {
+        std::shared_lock lock(surf_data->m);
+        if (surf_data->overlay_surf)
+            return true;
+    }
+
+    std::unique_lock lock(surf_data->m);
+    if (surf_data->overlay_surf)
+        return true;
+
     surf_data->queue = globals->queue;
 
     if (!surf_data->overlay_surf) {
@@ -157,6 +182,7 @@ bool Wayland::ensure_overlay_data(const std::shared_ptr<surface_data>& surf_data
         wl_subsurface_set_position(surf_data->sub_surf, 0, 0);
         wl_subsurface_place_above(surf_data->sub_surf, surf_data->surface);
         wl_subsurface_set_desync(surf_data->sub_surf);
+        surf_data->flush_pending(true);
         SPDLOG_DEBUG("wl overlay created: parent=0x{:x}, overlay=0x{:x}, subsurface=0x{:x}",
                      (uint64_t)surf_data->surface, (uint64_t)surf_data->overlay_surf,
                      (uint64_t)surf_data->sub_surf);
@@ -386,7 +412,7 @@ void Wayland::destroy_wayland_objects()
 {
     std::vector<std::shared_ptr<surface_data>> surface_list;
     {
-        std::lock_guard lock(surf_m);
+        std::unique_lock lock(surf_m);
         for (auto& [_, surf_data] : surfaces) {
             if (surf_data)
                 surface_list.push_back(surf_data);
@@ -398,6 +424,7 @@ void Wayland::destroy_wayland_objects()
                 surface_list.push_back(surf_data);
         }
         egl_surfaces.clear();
+        cached_surface.reset();
     }
 
     active_surface.reset();
@@ -433,13 +460,14 @@ void Wayland::update_import(const std::shared_ptr<surface_data>& surf_data)
     if (!surf_data || !surf_data->display)
         return;
 
-    std::lock_guard lock(surf_data->m);
+    std::unique_lock lock(surf_data->m);
     auto* globals = ctx.get_global(surf_data->display);
     if (!globals || !globals->dmabuf)
         return;
 
     Fdinfo next_fdinfo;
     uint64_t generation = 0;
+    bool unsupported_transport = false;
     {
         std::lock_guard lock(ipc->m);
         generation = ipc->import_generation.load(std::memory_order_acquire);
@@ -449,8 +477,20 @@ void Wayland::update_import(const std::shared_ptr<surface_data>& surf_data)
         if (ipc->fdinfo.dmabuf_buffer.empty())
             return;
 
-        next_fdinfo = std::move(ipc->fdinfo);
-        ipc->fdinfo = {};
+        if (ipc->fdinfo.opaque_size > 0) {
+            unsupported_transport = true;
+            ipc->fdinfo = {};
+        } else {
+            next_fdinfo = std::move(ipc->fdinfo);
+            ipc->fdinfo = {};
+        }
+    }
+
+    if (unsupported_transport) {
+        SPDLOG_DEBUG("wl dmabuf import rejected opaque-fd transport");
+        ipc->clear_frames();
+        ipc->send_import_failed();
+        return;
     }
 
     fdinfo = std::move(next_fdinfo);
@@ -490,6 +530,7 @@ void Wayland::update_import(const std::shared_ptr<surface_data>& surf_data)
     }
 
     imported_generation = generation;
+    surf_data->flush_pending(true);
 
     for (auto& buf : surf_data->buffers)
         release_to_server(buf.get());
@@ -497,8 +538,6 @@ void Wayland::update_import(const std::shared_ptr<surface_data>& surf_data)
 
 void Wayland::dispatch_events(const std::shared_ptr<surface_data>& surf_data)
 {
-    update_focus();
-
     if (!surf_data || !surf_data->display)
         return;
 
@@ -506,8 +545,11 @@ void Wayland::dispatch_events(const std::shared_ptr<surface_data>& surf_data)
     if (!globals || !globals->queue)
         return;
 
-    wl_display_dispatch_queue_pending(surf_data->display, globals->queue);
-    wl_display_flush(surf_data->display);
+    // Callbacks can queue requests, such as destroying presentation feedback.
+    if (wl_display_dispatch_queue_pending(surf_data->display, globals->queue) > 0)
+        surf_data->flush_pending(true);
+
+    update_focus();
 }
 
 void Wayland::update_focus()
@@ -556,7 +598,7 @@ std::shared_ptr<shm_buffer> Wayland::present(const std::shared_ptr<surface_data>
     if (!surf_data || !surf_data->overlay_surf)
         return nullptr;
 
-    std::lock_guard lock(surf_data->m);
+    std::unique_lock lock(surf_data->m);
 
     if (surf_data->buffers.empty())
         return nullptr;
@@ -588,7 +630,7 @@ std::shared_ptr<shm_buffer> Wayland::present(const std::shared_ptr<surface_data>
     wl_surface_damage(surf_data->overlay_surf, 0, 0, slot->width, slot->height);
     wl_surface_damage_buffer(surf_data->overlay_surf, 0, 0, slot->width, slot->height);
     wl_surface_commit(surf_data->overlay_surf);
-    wl_display_flush(surf_data->display);
+    surf_data->flush_pending(true);
     surf_data->attached = true;
 
     return slot;
@@ -599,7 +641,7 @@ void Wayland::detach(const std::shared_ptr<surface_data>& surf_data, bool wait_f
     if (!surf_data)
         return;
 
-    std::lock_guard lock(surf_data->m);
+    std::unique_lock lock(surf_data->m);
     ipc->clear_frames();
     for (auto& buf : surf_data->buffers) {
         if (buf)
@@ -627,9 +669,15 @@ void Wayland::run_thread(std::shared_ptr<surface_data> surf_data)
         if (!ipc->connected.load(std::memory_order_acquire)) {
             detach(surf_data);
         } else {
-            update_import(surf_data);
-            present(surf_data);
-            dispatch_events(surf_data);
+            if (!ipc->layer_output() && ensure_overlay_data(surf_data)) {
+                update_import(surf_data);
+                present(surf_data);
+            }
+        }
+
+        if (surf_data && surf_data->display && surf_data->flush_pending(false)) {
+            if (wl_display_flush(surf_data->display) < 0 && errno == EAGAIN)
+                surf_data->flush_pending(true);
         }
 
         if (quit.load())
